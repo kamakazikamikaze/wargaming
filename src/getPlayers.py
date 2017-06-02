@@ -2,7 +2,7 @@ from __future__ import print_function
 import json
 from multiprocessing import Manager, Pipe, Process
 from requests.exceptions import ConnectionError
-import pickle
+import cPickle as pickle
 from sys import argv
 from wotconsole import WOTXResponseError, top_players
 
@@ -106,7 +106,7 @@ def query(worker_number, parent_pipe, api_key, result_queue, fields,
         except Exception as e:
             print('{}: Unknown error: {}'.format(worker_number, e))
             try:
-                parent_pipe.send(wg)
+                parent_pipe.send(e)
             except:
                 pass
             break
@@ -138,8 +138,8 @@ def combine_keys(data_queue, outfile, conn, delay=0.0000000001, debug=False):
     except Exception as e:
         print('Unknown error: {}'.format(e))
     finally:
-        with open(outfile, 'w') as f:
-            pickle.dump(players, f)
+        with open(outfile, 'wb') as f:
+            pickle.dump(players, f, pickle.HIGHEST_PROTOCOL)
 
 
 if __name__ == '__main__':
