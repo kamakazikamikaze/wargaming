@@ -2,7 +2,7 @@ from __future__ import print_function
 # from collections import defaultdict
 import gc
 import json
-from multiprocessing import Manager, Pipe, Process, Pool
+from multiprocessing import Manager, Pipe, Process
 import sqlite3
 from requests import ConnectionError
 from sys import argv
@@ -68,7 +68,8 @@ def query(player, error_queue, api_key, result_queue,
             pass
 
 
-def combine_keys(data_queue, outfile, conn, delay=0.0000000001, debug=False):
+def update_stats_database(data_queue, outfile, conn,
+                          delay=0.0000000001, debug=False):
     # This delay float is overkill, but we don't want to block for long!
 
     # with open(outfile, 'w') as f:
@@ -139,131 +140,175 @@ def combine_keys(data_queue, outfile, conn, delay=0.0000000001, debug=False):
         finally:
             db.commit()
 
-    # CSV file gets too long!
-    # with open(outfile, 'w') as f:
-    #     buffer = 0
-    #     try:
-    #         while not conn.poll(delay):
-    #             while not data_queue.empty():
-    #                 data = data_queue.get()
-    #                 f.write(
-    #                     str(data[0]) + ',' + ','.join(
-    #                         map(lambda x: str(x['tank_id']), data[1])) + '\n')
-    #                 if debug:
-    #                     print('Added tanks for', data[0])
-    #                 buffer += 1
-    #                 if buffer >= 250:
-    #                     f.flush()
-    #                     buffer = 0
-    #                     if debug:
-    #                         print('Flushed to file')
-    #         while not data_queue.empty():
-    #             data = data_queue.get()
-    #             f.write(
-    #                 str(data[0]) + ',' + ','.join(
-    #                     map(lambda x: str(x['tank_id']), data[1])) + '\n')
-    #             if debug:
-    #                 print('Added tanks for', data[0])
-    #             buffer += 1
-    #             if buffer >= 250:
-    #                 f.flush()
-    #                 buffer = 0
-    #                 if debug:
-    #                     print('Flushed to file')
 
-    #     except (IOError, EOFError):
-    #         print('Did the parent terminate?')
+def update_csv(queue, stats_csv, player_csv, conn, delay, debug):
+    pass
 
-    # Pickle to file is too large!
-    # tanks = defaultdict(set)
-    # try:
-    #     while not conn.poll(delay):
-    #         while not data_queue.empty():
-    #             data = data_queue.get()
-    #             for entry in data[1]:
-    #                 tanks[entry['tank_id']].add(data[0])
-    #             if debug:
-    #                 print('Added tanks for', data[0])
-    #     while not data_queue.empty():
-    #         data = data_queue.get()
-    #         for entry in data[1]:
-    #             tanks[entry['tank_id']].add(data[0])
-    #         if debug:
-    #             print('Added tanks for', data[0])
-    # except (IOError, EOFError):
-    #     print('Did the parent terminate?')
-    # finally:
-    #     with open(outfile, 'wb') as f:
-    #         if debug:
-    #             print('CK: Starting the pickling process . . .')
-    #         pickle.dump(tanks, f, pickle.HIGHEST_PROTOCOL)
-    #         if debug:
-    #             print('CK: Pickling complete!')
+
+def generate_players(sqldb, start, finish):
+    '''
+    Create the list of players to query for. If the SQLite database already has
+    a list, we'll use it; otherwise we'll generate a range.
+
+    :param sqldb: File name of SQLite database
+    :param int start: Starting account ID number
+    :param int finish: Ending account ID number
+    '''
+    with sqlite3.connect(sqldb) as db:
+        try:
+            return filter(lambda x: start <= x <= finish,
+                          map(lambda p: p[0],
+                              db.execute('select id from players').fetchall()))
+        except (ValueError, sqlite3.OperationalError):
+            return range(start, finish)
+
+# 1 Worker to export to CSV
+# 1 Worker to export errors to file
+# 1 Worker to handle database
+# N-number of workers to handle requests to API
 
 if __name__ == '__main__':
     with open(argv[1]) as f:
         config = json.load(f)
 
     manager = Manager()
-    player_queue = manager.Queue()
     error_queue = manager.Queue()
 
     process_count = 4 if 'pool size' not in config else config['pool size']
-    delay = 0.0000000001 if 'delay' not in config else config['delay']
-    timeout = 15 if 'timeout' not in config else config['timeout']
+    start_account = 1 if 'start account' not in config else config[
+        'start account']
     max_account = 14000000 if 'max account' not in config else config[
         'max account']
     max_retries = 5 if 'max retries' not in config else config[
         'max retries']
-    debug = False if 'debug' not in config else config['debug']
-    start_account = 1 if 'start account' not in config else config[
-        'start account']
+    timeout = 15 if 'timeout' not in config else config['timeout']
+    delay = 0.0000000001 if 'delay' not in config else config['delay']
     join_wait = 1800 if 'join wait' not in config else config['join wait']
-    queue_handler_conn, queue_child_conn = Pipe()
-    pool = Pool(process_count, maxtasksperchild=10)
-    queue_handler = Process(
-        name='Tanks DB Handler',
-        target=combine_keys,
-        args=(
-            player_queue,
-            # config['input'],
-            config['output'],
-            queue_child_conn,
-            delay,
-            debug))
-    try:
-        # pool_handler_conn, pool_child_conn = Pipe()
-        if debug:
-            print('Starting queue handler')
-        queue_handler.start()
-        if debug:
-            print('Adding work to pool')
-        for i in range(start_account, max_account):
-            pool.apply_async(
-                query,
-                (
-                    i,
-                    # pool_child_conn,
-                    error_queue,
+    debug = False if 'debug' not in config else config['debug']
+    if 'database' not in config:
+        config['database'] = None
+
+    player_ids = generate_players(
+        config['database'],
+        start_account,
+        max_account)
+
+    handlers = []
+    handler_conns = []
+    queues = []
+
+    if 'sql' in config['output']:
+        sql_handler_conn, sql_child_conn = Pipe()
+        sql_queue = manager.Queue()
+        sql_handler = Process(
+            name='Stats DB Handler',
+            target=update_stats_database,
+            args=(
+                sql_queue,
+                # config['input'],
+                config['output']['sql'],
+                sql_child_conn,
+                delay,
+                debug))
+        handlers.append(sql_handler)
+        handler_conns.append(sql_child_conn)
+        queues.append(sql_queue)
+
+    if 'csv' in config['output']:
+        csv_handler_conn, csv_child_conn = Pipe()
+        csv_queue = manager.Queue()
+        csv_handler = Process(
+            name='Player DB Handler',
+            target=update_csv,
+            args=(
+                csv_queue,
+                csv_child_conn,
+                # config['input'],
+                config['output']['csv'],
+                config['output']['players'],
+                config['output']['tanks'],
+                delay,
+                debug))
+        handlers.append(csv_handler)
+        handler_conns.append(csv_child_conn)
+        queues.append(csv_queue)
+
+    pipes = []
+    processes = []
+    waiting = []
+    for ps in range(0, process_count):
+        parent_conn, child_conn = Pipe()
+        processes.append(
+            Process(
+                target=query,
+                args=(
+                    ps,
+                    child_conn,
                     config['application_id'],
-                    player_queue,
+                    queues,
                     delay,
                     timeout,
                     max_retries,
-                    debug
-                ))
+                    debug)))
+        pipes.append(parent_conn)
+        waiting.append(True)
+
+    try:
+        # pool_handler_conn, pool_child_conn = Pipe()
+        if debug:
+            print('Starting data handlers')
+        for handler in handlers:
+            handler.start()
+        for p in processes:
+            p.start()
+        not_done = True
+        player_iter = iter(player_ids)
+        if debug:
+            print('Adding work to pool')
+        while not_done:
+            for n, process in enumerate(processes):
+                if pipes[n].poll(delay):
+                    received = pipes[n].recv()
+                    if isinstance(received, int):
+                        if received > 0:
+                            if debug:
+                                print(
+                                    'Parent: Worker {} got page {}'.format(
+                                        n, received))
+                            waiting[n] = True
+                        else:
+                            if debug:
+                                print(
+                                    'Parent: Worker {} hit page max'.format(n))
+                            not_done = False
+                            break
+                    else:
+                        print('Exception from child {}:'.format(n), received)
+                        not_done = False
+                        break
+                if waiting[n]:
+                    try:
+                        pipes[n].send(player_iter.next())
+                        waiting[n] = False
+                    except StopIteration:
+                        if debug:
+                            print('No more player IDs to process')
+                        not_done = False
+                        break
     except (KeyboardInterrupt, SystemExit):
         print('Attempting to prematurely terminate processes')
-        pool.terminate()
     finally:
-        pool.close()
-        pool.join()
+        for n, p in enumerate(processes):
+            pipes[n].send(0)
+            p.join()
         # player_queue.close()
-        queue_child_conn.send(-1)
+        for conn in handler_conns:
+            conn.send(-1)
+        # sql_handler_conn.send(-1)
+        # csv_handler_conn.send(-1)
         if debug:
-            print('Sending signal to queue handler')
-        queue_handler.join(join_wait)
-        if not error_queue.empty() and debug:
-            print('Errors received from pool:')
-        while error_queue.qsize() and debug:
-            print('\t', error_queue.get())
+            print('Sending signal to queue handler(s)')
+        for handler in handlers:
+            handler.join(join_wait)
+        # sql_handler.join(join_wait)
+        # csv_handler.join(join_wait)
