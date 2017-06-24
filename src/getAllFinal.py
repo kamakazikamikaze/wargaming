@@ -1,12 +1,13 @@
 from __future__ import print_function
 # from collections import defaultdict
 from datetime import datetime
-# import gc
+import gc
 import json
 from multiprocessing import Manager, Pipe, Process
 import sqlite3
 from requests import ConnectionError
 from sys import argv
+import signal
 from wotconsole import WOTXResponseError, player_tank_statistics, player_data
 from wotconsole import vehicle_info
 
@@ -22,6 +23,8 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
     Pull data from WG's servers. This allows us to retry pages up until a
     certain point
     '''
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    buf = 0
     not_done = True
     while not_done:
         try:
@@ -38,21 +41,16 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                     '{}: Bad entry from pipe'.format(worker_number))
             retries = max_retries
             realm = 'xbox'
+            ans = None
+            player_queued = False
+            queried = False
             while retries:
                 try:
-                    # Try Xbox first
-                    ans = player_data(
-                        received,
-                        api_key,
-                        fields=[
-                            '-statistics.company',
-                            '-statistics.all.frags',
-                            '-statistics.frags',
-                            '-private'],
-                        timeout=timeout,
-                        api_realm=realm)
-                    if not ans[str(received)]:
-                        realm = 'ps4'
+                    # We can get a query limit error from the server in this
+                    # loop. To prevent duplicate player retrieval, we'll check
+                    # if we've already received a response for it and move on
+                    if not queried:
+                        # Try Xbox first
                         ans = player_data(
                             received,
                             api_key,
@@ -63,27 +61,45 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                                 '-private'],
                             timeout=timeout,
                             api_realm=realm)
+                        if not ans[str(received)]:
+                            realm = 'ps4'
+                            ans = player_data(
+                                received,
+                                api_key,
+                                fields=[
+                                    '-statistics.company',
+                                    '-statistics.all.frags',
+                                    '-statistics.frags',
+                                    '-private'],
+                                timeout=timeout,
+                                api_realm=realm)
+                        queried = True
+                    # An empty resposne = player was removed or ID not yet made
                     if ans.data and ans[str(received)]:
-                        p = ans[str(received)]
-                        p.update(p['statistics']['all'])
-                        del p['statistics']['all']
-                        p.update(p['statistics'])
-                        del p['statistics']
-                        p['console'] = realm
-                        p['created_at_raw'] = p['created_at']
-                        p['last_battle_time_raw'] = p['last_battle_time']
-                        p['updated_at_raw'] = p['updated_at']
-                        p['created_at'] = datetime.strftime(
-                            datetime.utcfromtimestamp(p['created_at']),
-                            '%Y-%m-%d')
-                        p['last_battle_time'] = datetime.strftime(
-                            datetime.utcfromtimestamp(p['last_battle_time']),
-                            '%Y-%m-%d')
-                        p['updated_at'] = datetime.strftime(
-                            datetime.utcfromtimestamp(p['updated_at']),
-                            '%Y-%m-%d')
-                        for result_queue in result_queues:
-                            result_queue.put(('player', p))
+                        # Prevent duplicate entries into Queues
+                        if not player_queued:
+                            player_queued = True
+                            p = ans[str(received)]
+                            p.update(p['statistics']['all'])
+                            del p['statistics']['all']
+                            p.update(p['statistics'])
+                            del p['statistics']
+                            p['console'] = realm
+                            p['created_at_raw'] = p['created_at']
+                            p['last_battle_time_raw'] = p['last_battle_time']
+                            p['updated_at_raw'] = p['updated_at']
+                            p['created_at'] = datetime.strftime(
+                                datetime.utcfromtimestamp(p['created_at']),
+                                '%Y-%m-%d')
+                            p['last_battle_time'] = datetime.strftime(
+                                datetime.utcfromtimestamp(
+                                    p['last_battle_time']),
+                                '%Y-%m-%d')
+                            p['updated_at'] = datetime.strftime(
+                                datetime.utcfromtimestamp(p['updated_at']),
+                                '%Y-%m-%d')
+                            for result_queue in result_queues:
+                                result_queue.put(('player', p))
                         tanks = player_tank_statistics(
                             received,
                             api_key,
@@ -115,6 +131,13 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                                 del tank['all']
                                 for result_queue in result_queues:
                                     result_queue.put(('tank', tank))
+                    buf += 1
+                    if buf >= 1000:
+                        gc.collect()
+                        buf = 0
+                        if debug:
+                            print(
+                                'QT{:2}: Cleared memory'.format(worker_number))
                     parent_pipe.send(received)
                     break
                 # Patch: until WOTXResponseError is updated, exceeding the API
@@ -135,19 +158,26 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                         parent_pipe.send('{} (Error)'.format(received))
                         error_queue.put((received, wg))
                         break
+            if not retries:
+                parent_pipe.send('{} (Retry limit exceeded'.format(received))
+                error_queue.put((received, Exception('Retry limit exceeded')))
+            # Just in case!
+            del ans
         except Exception as e:
             print('{}: Unknown error: {}'.format(ps, e))
-            # try:
-            #    error_queue.put((received, e))
-            #     # parent_pipe.send(e)
-            # except:
-            #     pass
+            try:
+                error_queue.put((-1, e))
+                parent_pipe.send('Unknown (Error)')
+            except:
+                pass
+    print('QT{:2}: Exiting'.format(worker_number))
 
 
-def update_stats_database(data_queue, conn, tanks, outfile,
+def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
                           delay=0.0000000001, debug=False):
     with sqlite3.connect(outfile) as db:
-        buffer = 0
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        buf = 0
         c = db.cursor()
         # setup database
         c.execute("""Create table if not exists tanks(
@@ -160,15 +190,16 @@ def update_stats_database(data_queue, conn, tanks, outfile,
             nation TEXT,
             price_gold INTEGER)""")
         for _, t in tanks.iteritems():
-            c.execute('insert into tanks values (?,?,?,?,?,?,?,?)', tuple(t[k] for k in (
-                'name',
-                'short_name',
-                'tank_id',
-                'tier',
-                'is_premium',
-                'type',
-                'nation',
-                'price_gold')))
+            c.execute('insert or ignore into tanks values (?,?,?,?,?,?,?,?)',
+                      tuple(t[k] for k in (
+                          'name',
+                          'short_name',
+                          'tank_id',
+                          'tier',
+                          'is_premium',
+                          'type',
+                          'nation',
+                          'price_gold')))
         db.commit()
         c.execute("""Create table if not exists players(
             account_id INTEGER PRIMARY KEY,
@@ -311,61 +342,82 @@ def update_stats_database(data_queue, conn, tanks, outfile,
         )
         try:
             while not conn.poll(delay):
-                while not data_queue.empty():
+                try:
+                    while not data_queue.empty():
+                        classification, data = data_queue.get()
+                        if classification == 'tank':
+                            c.execute(
+                                'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                tuple(data[t] for t in tank_keys))
+                        elif classification == 'player':
+                            try:
+                                c.execute(
+                                    'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    tuple(data[p] for p in player_keys))
+                            except sqlite3.IntegrityError:
+                                pass
+                        else:
+                            print('SQL : Uh, got some bad data?')
+                        buf += 1
+                        # if debug:
+                        #     print('SQL: Got data for', data['account_id'])
+                        if buf >= 2500:
+                            db.commit()
+                            gc.collect()
+                            buf = 0
+                            if debug:
+                                print('SQL : Cleared buffer')  # and memory')
+                except (ValueError, sqlite3.OperationalError) as oe:
+                    error_queue.put(
+                        ('(sql) {}'.format(data['account_id']), oe))
+            if debug:
+                print('SQL : Parent signal received. Clearing queue')
+            while not data_queue.empty():
+                try:
                     classification, data = data_queue.get()
                     if classification == 'tank':
                         c.execute(
                             'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                             tuple(data[t] for t in tank_keys))
                     elif classification == 'player':
-                        c.execute(
-                            'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                            tuple(data[p] for p in player_keys))
+                        try:
+                            c.execute(
+                                'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                tuple(data[p] for p in player_keys))
+                        except sqlite3.IntegrityError:
+                            pass
                     else:
-                        print('SQL: Uh, got some bad data?')
-                    buffer += 1
+                        print('SQL : Uh, got some bad data?')
+                    buf += 1
                     # if debug:
                     #     print('SQL: Got data for', data['account_id'])
-                    if buffer >= 2500:
+                    if buf >= 2500:
                         db.commit()
-                        # gc.collect()
-                        buffer = 0
+                        gc.collect()
+                        buf = 0
                         if debug:
-                            print('SQL: Cleared buffer')  # and memory')
-            if debug:
-                print('SQL: Parent signal received. Clearing queue')
-            while not data_queue.empty():
-                classification, data = data_queue.get()
-                if classification == 'tank':
-                    c.execute(
-                        'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                        tuple(data[t] for t in tank_keys))
-                elif classification == 'player':
-                    c.execute(
-                        'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-                        tuple(data[p] for p in player_keys))
-                else:
-                    print('Uh, got some bad data?')
-                buffer += 1
-                # if debug:
-                #     print('SQL: Got data for', data['account_id'])
-                if buffer >= 2500:
-                    db.commit()
-                    # gc.collect()
-                    buffer = 0
-                    if debug:
-                        print('SQL: Cleared buffer')  # and memory')
+                            print('SQL : Cleared buffer')  # and memory')
+                except (ValueError, sqlite3.OperationalError):
+                    error_queue.put(
+                        ('(sql) {}'.format(data['account_id']), oe))
 
         except (IOError, EOFError):
-            print('Did the parent terminate?')
+            print('SQL : Did the parent terminate?')
+        except Exception as e:
+            print('SQL :', e)
+            error_queue.put(('sql', e))
         finally:
             db.commit()
+            print('SQL : Exiting')
 
 
-def update_csv(data_queue, conn, tanks, stats_filename, player_filename,
-               tankinfo_filename, delay=0.0000000001, debug=False):
-    stats_csv = open(stats_filename, 'w')
-    player_csv = open(player_filename, 'w')
+def update_csv(data_queue, conn, tanks, stats_filename,
+               player_filename, tankinfo_filename, error_queue,
+               delay=0.0000000001, debug=False):
+    buf = 0
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    stats_csv = open(stats_filename, 'a')
+    player_csv = open(player_filename, 'a')
     with open(tankinfo_filename, 'w') as tankinfo_csv:
         tankinfo_csv.write(
             'name,short_name,tank_id,tier,is_premium,type,nation,price_gold\n')
@@ -385,94 +437,80 @@ def update_csv(data_queue, conn, tanks, stats_filename, player_filename,
                         'price_gold')
                     )
                 )) + '\n')
-        player_keys = (
-            'account_id',
-            'battles',
-            'capture_points',
-            'console',
-            'created_at',
-            'created_at_raw',
-            'damage_assisted_radio',
-            'damage_assisted_track',
-            'damage_dealt',
-            'damage_received',
-            'direct_hits_received',
-            'dropped_capture_points',
-            'explosion_hits',
-            'explosion_hits_received',
-            'global_rating',
-            'hits',
-            'last_battle_time',
-            'last_battle_time_raw',
-            'losses',
-            'max_damage',
-            'max_damage_tank_id',
-            'max_frags',
-            'max_frags_tank_id',
-            'max_xp',
-            'max_xp_tank_id',
-            'nickname',
-            'no_damage_direct_hits_received',
-            'piercings',
-            'piercings_received',
-            'shots',
-            'spotted',
-            'survived_battles',
-            'trees_cut',
-            'updated_at',
-            'updated_at_raw',
-            'wins',
-            'xp'
-        )
-        player_csv.write(','.join(player_keys) + '\n')
-        tank_keys = (
-            'account_id',
-            'battle_life_time',
-            'battles',
-            'capture_points',
-            'damage_assisted_radio',
-            'damage_assisted_track',
-            'damage_dealt',
-            'damage_received',
-            'direct_hits_received',
-            'dropped_capture_points',
-            'explosion_hits',
-            'explosion_hits_received',
-            'hits',
-            'last_battle_time',
-            'last_battle_time_raw',
-            'losses',
-            'mark_of_mastery',
-            'max_frags',
-            'max_xp',
-            'no_damage_direct_hits_received',
-            'piercings',
-            'piercings_received',
-            'shots',
-            'spotted',
-            'survived_battles',
-            'tank_id',
-            'trees_cut',
-            'wins',
-            'xp'
-        )
-        stats_csv.write(','.join(tank_keys) + '\n')
-        try:
-            while not conn.poll(delay):
-                while not data_queue.empty():
-                    classification, data = data_queue.get()
-                    if classification == 'tank':
-                        stats_csv.write(','.join(
-                            tuple(unicode(data[t]) for t in tank_keys)) + '\n')
-                    elif classification == 'player':
-                        player_csv.write(','.join(
-                            tuple(unicode(data[p]) for p in player_keys)) + '\n')
-                    else:
-                        print('CSV: Uh, got some bad data?')
-                    # if debug:
-                    #     print('CSV: Got data for', data['account_id'])
-            if debug:
-                print('CSV: Parent signal received. Clearing queue')
+    player_keys = (
+        'account_id',
+        'battles',
+        'capture_points',
+        'console',
+        'created_at',
+        'created_at_raw',
+        'damage_assisted_radio',
+        'damage_assisted_track',
+        'damage_dealt',
+        'damage_received',
+        'direct_hits_received',
+        'dropped_capture_points',
+        'explosion_hits',
+        'explosion_hits_received',
+        'global_rating',
+        'hits',
+        'last_battle_time',
+        'last_battle_time_raw',
+        'losses',
+        'max_damage',
+        'max_damage_tank_id',
+        'max_frags',
+        'max_frags_tank_id',
+        'max_xp',
+        'max_xp_tank_id',
+        'nickname',
+        'no_damage_direct_hits_received',
+        'piercings',
+        'piercings_received',
+        'shots',
+        'spotted',
+        'survived_battles',
+        'trees_cut',
+        'updated_at',
+        'updated_at_raw',
+        'wins',
+        'xp'
+    )
+    player_csv.write(','.join(player_keys) + '\n')
+    tank_keys = (
+        'account_id',
+        'battle_life_time',
+        'battles',
+        'capture_points',
+        'damage_assisted_radio',
+        'damage_assisted_track',
+        'damage_dealt',
+        'damage_received',
+        'direct_hits_received',
+        'dropped_capture_points',
+        'explosion_hits',
+        'explosion_hits_received',
+        'hits',
+        'last_battle_time',
+        'last_battle_time_raw',
+        'losses',
+        'mark_of_mastery',
+        'max_frags',
+        'max_xp',
+        'no_damage_direct_hits_received',
+        'piercings',
+        'piercings_received',
+        'shots',
+        'spotted',
+        'survived_battles',
+        'tank_id',
+        'trees_cut',
+        'wins',
+        'xp'
+    )
+    stats_csv.write(','.join(tank_keys) + '\n')
+    try:
+        while not conn.poll(delay):
             while not data_queue.empty():
                 classification, data = data_queue.get()
                 if classification == 'tank':
@@ -482,20 +520,51 @@ def update_csv(data_queue, conn, tanks, stats_filename, player_filename,
                     player_csv.write(','.join(
                         tuple(unicode(data[p]) for p in player_keys)) + '\n')
                 else:
-                    print('Uh, got some bad data?')
+                    print('CSV : Uh, got some bad data?')
                 # if debug:
                 #     print('CSV: Got data for', data['account_id'])
+                buf += 1
+                if buf >= 2500:
+                    gc.collect()
+                    buf = 0
+                    if debug:
+                        print('CSV : Cleared memory')
+        if debug:
+            print('CSV : Parent signal received. Clearing queue')
+        while not data_queue.empty():
+            classification, data = data_queue.get()
+            if classification == 'tank':
+                stats_csv.write(','.join(
+                    tuple(unicode(data[t]) for t in tank_keys)) + '\n')
+            elif classification == 'player':
+                player_csv.write(','.join(
+                    tuple(unicode(data[p]) for p in player_keys)) + '\n')
+            else:
+                print('CSV : Uh, got some bad data?')
+            buf += 1
+            if buf >= 2500:
+                gc.collect()
+                buf = 0
+                if debug:
+                    print('CSV : Cleared memory')
+            # if debug:
+            #     print('CSV: Got data for', data['account_id'])
 
-        except (IOError, EOFError):
-            print('Did the parent terminate?')
-        finally:
-            player_csv.close()
-            stats_csv.close()
+    except (IOError, EOFError):
+        print('CSV: Did the parent terminate?')
+    except Exception as e:
+        error_queue.put(('csv', e))
+    finally:
+        player_csv.close()
+        stats_csv.close()
+        print('CSV : Exiting')
 
 
 def error_logger(exception_queue, outfile, conn,
                  delay=0.0000000001, debug=False):
     try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        buf = 0
         with open(outfile, 'w') as logfile:
             not_done = True
             while not_done:
@@ -504,9 +573,18 @@ def error_logger(exception_queue, outfile, conn,
                 while not exception_queue.empty():
                     pid, e = exception_queue.get()
                     logfile.write(str(pid) + ': ' + str(e) + '\n')
+                    logfile.flush()
+                    buf += 1
+                    if buf >= 2500:
+                        gc.collect()
+                        buf = 0
+                        if debug:
+                            print('Log : Cleared memory')
+    except (IOError, EOFError):
+        print('Log : Did the parent terminate?')
     except Exception as e:
-        print('Error logger:', e)
-        print('Error logger: Exiting')
+        print('Log :', e)
+        print('Log : Exiting')
 
 
 def generate_players(sqldb, start, finish):
@@ -599,6 +677,7 @@ if __name__ == '__main__':
                 # config['input'],
                 vehicles,
                 config['output']['sql'],
+                error_queue,
                 delay,
                 debug))
         handlers.append(sql_handler)
@@ -619,6 +698,7 @@ if __name__ == '__main__':
                 config['output']['csv'],
                 config['output']['players'],
                 config['output']['tanks'],
+                error_queue,
                 delay,
                 debug))
         handlers.append(csv_handler)
@@ -657,14 +737,15 @@ if __name__ == '__main__':
         not_done = True
         player_iter = iter(player_ids)
         if debug:
-            print('Adding work to pool')
+            print('Main: Adding work to pool')
+        buf = 0
         while not_done:
             for n, process in enumerate(processes):
                 if pipes[n].poll(delay):
                     received = pipes[n].recv()
                     if debug and received:
                         print(
-                            'Parent: Worker {} got account {}'.format(
+                            'Main: Worker {:2} got account {}'.format(
                                 n, received))
                     waiting[n] = True
                 if waiting[n]:
@@ -673,11 +754,17 @@ if __name__ == '__main__':
                         waiting[n] = False
                     except StopIteration:
                         if debug:
-                            print('No more player IDs to process')
+                            print('Main: No more player IDs to process')
                         not_done = False
                         break
+            buf += 1
+            if buf >= 5000000:
+                gc.collect()
+                buf = 0
+                if debug:
+                    print('Main: Cleared memory')
     except (KeyboardInterrupt, SystemExit):
-        print('Attempting to prematurely terminate processes')
+        print('Main: Attempting to prematurely terminate processes')
     finally:
         for n, p in enumerate(processes):
             pipes[n].send(0)
@@ -688,7 +775,7 @@ if __name__ == '__main__':
         # sql_handler_conn.send(-1)
         # csv_handler_conn.send(-1)
         if debug:
-            print('Sending signal to queue handler(s)')
+            print('Main: Sending signal to queue handler(s)')
         for handler in handlers:
             handler.join(join_wait)
         # sql_handler.join(join_wait)
