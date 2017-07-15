@@ -1,0 +1,18 @@
+{
+	"application_id": "demo",
+	"lang": "en",
+	"output": {
+		"players": "output/playerinfo ps4.csv",
+		"csv": "output/playerbattleinfo ps4.csv",
+		"sql": "output/playerStats.sqlite",
+		"tanks": "output/tankinfo.csv"
+	},
+	"debug": true,
+	"pool size": 14,
+	"max retries": 15,
+	"database": "data/players.sqlite",
+	"join wait": null,
+	"error log": "log/finalerrorlog.log",
+	"start account": 1073740000,
+	"max account": 1079000000
+}

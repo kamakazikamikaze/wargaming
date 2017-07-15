@@ -1,0 +1,18 @@
+{
+	"application_id": "demo",
+	"lang": "en",
+	"output": {
+		"players": "output/playerinfo xbox.csv",
+		"csv": "output/playerbattleinfo xbox.csv",
+		"sql": "output/playerStats.sqlite",
+		"tanks": "output/tankinfo.csv"
+	},
+	"debug": true,
+	"pool size": 14,
+	"max retries": 15,
+	"database": "data/players.sqlite",
+	"join wait": null,
+	"error log": "log/finalerrorlog.log",
+	"start account": 5000,
+	"max account": 12025000
+}

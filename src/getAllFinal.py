@@ -40,7 +40,7 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                 raise TypeError(
                     '{}: Bad entry from pipe'.format(worker_number))
             retries = max_retries
-            realm = 'xbox'
+            realm = 'xbox' if received < 1000000000 else 'ps4'
             ans = None
             player_queued = False
             queried = False
@@ -56,23 +56,23 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                             api_key,
                             fields=[
                                 '-statistics.company',
-                                '-statistics.all.frags',
                                 '-statistics.frags',
                                 '-private'],
                             timeout=timeout,
                             api_realm=realm)
-                        if not ans[str(received)]:
-                            realm = 'ps4'
-                            ans = player_data(
-                                received,
-                                api_key,
-                                fields=[
-                                    '-statistics.company',
-                                    '-statistics.all.frags',
-                                    '-statistics.frags',
-                                    '-private'],
-                                timeout=timeout,
-                                api_realm=realm)
+                        # Xbox and PS4 account ID ranges do not overlap
+                        # if not ans[str(received)]:
+                        #     realm = 'ps4'
+                        #     ans = player_data(
+                        #         received,
+                        #         api_key,
+                        #         fields=[
+                        #             '-statistics.company',
+                        #             '-statistics.all.frags',
+                        #             '-statistics.frags',
+                        #             '-private'],
+                        #         timeout=timeout,
+                        #         api_realm=realm)
                         queried = True
                     # An empty resposne = player was removed or ID not yet made
                     if ans.data and ans[str(received)]:
@@ -106,7 +106,6 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                             fields=[
                                 '-company',
                                 '-frags',
-                                '-all.frags',
                                 '-in_garage',
                                 '-in_garage_updated'],
                             timeout=timeout,
@@ -115,8 +114,7 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                         if str(received) not in tanks.data:
                             error_queue.put(
                                 (received, Exception(
-                                    """Method 'player_tank_statistics' did not
-                                    yield any tanks""")))
+                                    "Method 'player_tank_statistics' did not yield any tanks")))
                         elif tanks[str(received)] is None:
                             pass
                         else:
@@ -163,10 +161,11 @@ def query(worker_number, parent_pipe, api_key, result_queues, error_queue,
                 error_queue.put((received, Exception('Retry limit exceeded')))
             # Just in case!
             del ans
+            received = None
         except Exception as e:
             print('{}: Unknown error: {}'.format(ps, e))
             try:
-                error_queue.put((-1, e))
+                error_queue.put((received, e))
                 parent_pipe.send('Unknown (Error)')
             except:
                 pass
@@ -216,6 +215,7 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
             dropped_capture_points INTEGER,
             explosion_hits INTEGER,
             explosion_hits_received INTEGER,
+            frags INTEGER,
             global_rating INTEGER,
             hits INTEGER,
             last_battle_time TEXT,
@@ -255,6 +255,7 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
             'dropped_capture_points',
             'explosion_hits',
             'explosion_hits_received',
+            'frags',
             'global_rating',
             'hits',
             'last_battle_time',
@@ -292,6 +293,7 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
             dropped_capture_points INTEGER,
             explosion_hits INTEGER,
             explosion_hits_received INTEGER,
+            frags INTEGER,
             hits INTEGER,
             last_battle_time TEXT,
             last_battle_time_raw INTEGER,
@@ -322,6 +324,7 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
             'dropped_capture_points',
             'explosion_hits',
             'explosion_hits_received',
+            'frags',
             'hits',
             'last_battle_time',
             'last_battle_time_raw',
@@ -347,12 +350,12 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
                         classification, data = data_queue.get()
                         if classification == 'tank':
                             c.execute(
-                                'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                 tuple(data[t] for t in tank_keys))
                         elif classification == 'player':
                             try:
                                 c.execute(
-                                    'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                    'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                     tuple(data[p] for p in player_keys))
                             except sqlite3.IntegrityError:
                                 pass
@@ -377,12 +380,12 @@ def update_stats_database(data_queue, conn, tanks, outfile, error_queue,
                     classification, data = data_queue.get()
                     if classification == 'tank':
                         c.execute(
-                            'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                            'insert into stats values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                             tuple(data[t] for t in tank_keys))
                     elif classification == 'player':
                         try:
                             c.execute(
-                                'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                                'insert into players values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                 tuple(data[p] for p in player_keys))
                         except sqlite3.IntegrityError:
                             pass
@@ -452,6 +455,7 @@ def update_csv(data_queue, conn, tanks, stats_filename,
         'dropped_capture_points',
         'explosion_hits',
         'explosion_hits_received',
+        'frags',
         'global_rating',
         'hits',
         'last_battle_time',
@@ -490,6 +494,7 @@ def update_csv(data_queue, conn, tanks, stats_filename,
         'dropped_capture_points',
         'explosion_hits',
         'explosion_hits_received',
+        'frags',
         'hits',
         'last_battle_time',
         'last_battle_time_raw',
@@ -600,7 +605,7 @@ def generate_players(sqldb, start, finish):
         try:
             return filter(lambda x: start <= x <= finish,
                           map(lambda p: p[0],
-                              db.execute('select id from players').fetchall()))
+                              db.execute('select account_id from players').fetchall()))
         except (ValueError, sqlite3.OperationalError):
             return range(start, finish)
 
@@ -714,7 +719,7 @@ if __name__ == '__main__':
             Process(
                 target=query,
                 args=(
-                    ps,
+                    ps + 1,
                     child_conn,
                     config['application_id'],
                     queues,
@@ -746,7 +751,7 @@ if __name__ == '__main__':
                     if debug and received:
                         print(
                             'Main: Worker {:2} got account {}'.format(
-                                n, received))
+                                n + 1, received))
                     waiting[n] = True
                 if waiting[n]:
                     try:
