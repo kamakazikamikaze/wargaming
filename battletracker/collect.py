@@ -28,7 +28,8 @@ class Player(Base):
     __tablename__ = 'players'
 
     account_id = Column(Integer, primary_key=True)
-    nickname = Column(String(25), nullable=False)
+    # Biggest I've seen is 26 thanks to the "_old_######" accounts
+    nickname = Column(String(34), nullable=False)
     console = Column(String(4), nullable=False)
     created_at = Column(DateTime, nullable=False)
     last_battle_time = Column(DateTime, nullable=False)
@@ -137,6 +138,7 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
                             'Worker {}: Success pulling players {}'.format(
                                 worker_number, map(
                                     str, t_players)))
+                    del response
                     break
                 except (TypeError, ConnectionError) as ce:
                     if 'Max retries exceeded with url' in str(ce):
@@ -157,7 +159,6 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
                 if err_queue is not None:
                     err_queue.put(
                         (t_players, Exception('Retry limit exceeded')))
-            del response
             t_players = None
     except (KeyboardInterrupt, Empty):
         pass
@@ -372,6 +373,7 @@ if __name__ == '__main__':
         )
 
     try:
+        print('Started at:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         for logger in loggers:
             logger.start()
         for process in processes:
@@ -386,3 +388,4 @@ if __name__ == '__main__':
             conn.send(-1)
         for logger in loggers:
             logger.join()
+        print('Finished at:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
