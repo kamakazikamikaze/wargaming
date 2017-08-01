@@ -153,7 +153,7 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
                         sleep(0.1)
                     else:
                         if err_queue is not None:
-                            err_queue.put((t_players, ce))
+                            err_queue.put((t_players, wg))
                         break
             if not retries:
                 if err_queue is not None:
