@@ -6,7 +6,7 @@ import json
 from multiprocessing import Manager, Process, Pipe
 from Queue import Empty
 from requests import ConnectionError
-from sqlalchemy import Column, create_engine, event, DateTime, DDL
+from sqlalchemy import Column, create_engine, event, DateTime, DDL, func
 from sqlalchemy import ForeignKey, Integer, String
 # from _mysql_exceptions import OperationalError
 from sqlalchemy.ext.declarative import declarative_base
@@ -173,12 +173,49 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
             session.commit()
         except:
             pass
-    print('Worker{:3}: Exiting'.format(worker_number))
+    print(
+        'Worker{:3}: Exiting at {}'.format(
+            worker_number,
+            datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+
+
+def expand_max_players(config):
+    dbconf = config['database']
+    update = False
+    engine = create_engine(
+        "{protocol}://{user}:{password}@{address}/{name}".format(**dbconf),
+        echo=False)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    max_xbox = int(session.query(Player, func.max(Player.account_id)
+                                 ).filter(Player.console == 'xbox').one()[1])
+    max_ps4 = int(session.query(Player, func.max(Player.account_id)
+                                ).filter(Player.console == 'ps4').one()[1])
+    if 'max account' not in config['xbox']:
+        config['xbox']['max account'] = max_xbox + 200000
+        update = True
+    elif config['xbox']['max account'] - max_xbox < 50000:
+        config['xbox']['max account'] += 100000
+        update = True
+    if 'max account' not in config['ps4']:
+        config['ps4']['max account'] = max_ps4 + 200000
+        update = True
+    elif config['ps4']['max account'] - max_ps4 < 50000:
+        config['ps4']['max account'] += 100000
+        update = True
+
+    if update:
+        if 'debug' in config and config['debug']:
+            print('Updating configuration.')
+            print('Max Xbox account:', max_xbox)
+            print('Max PS4 account:', max_ps4)
+        with open(argv[1], 'w') as f:
+            json.dump(config, f)
 
 
 def log_worker(queue, filename, conn):
     try:
-        with open(filename, 'w') as f:
+        with open(datetime.now().strftime(filename), 'w') as f:
             count = 0
             while not conn.poll(0.00000001):
                 if not queue.empty():
@@ -260,13 +297,17 @@ if __name__ == '__main__':
     language = 'en' if 'language' not in config else config['language']
     process_count = 12 if 'processes' not in config else config[
         'processes']
+    if 'xbox' not in config:
+        config['xbox'] = dict()
+    if 'ps4' not in config:
+        config['ps4'] = dict()
     xbox_start_account = 5000 if 'start account' not in config[
         'xbox'] else config['xbox']['start account']
-    xbox_max_account = 13000000 if 'max account' not in config[
+    xbox_max_account = 13325000 if 'max account' not in config[
         'xbox'] else config['xbox']['max account']
     ps4_start_account = 1073740000 if 'start account' not in config[
         'ps4'] else config['ps4']['start account']
-    ps4_max_account = 1079000000 if 'max account' not in config[
+    ps4_max_account = 1080500000 if 'max account' not in config[
         'ps4'] else config['ps4']['max account']
     max_retries = 5 if 'max retries' not in config else config[
         'max retries']
@@ -389,3 +430,4 @@ if __name__ == '__main__':
         for logger in loggers:
             logger.join()
         print('Finished at:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        expand_max_players(config)
