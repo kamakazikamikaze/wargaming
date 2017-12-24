@@ -1,77 +1,24 @@
 from __future__ import print_function
 from datetime import datetime
 import gc
-from itertools import chain
 import json
 from multiprocessing import Manager, Process, Pipe
 from Queue import Empty
 from requests import ConnectionError
-from sqlalchemy import Column, create_engine, event, DateTime, DDL, func
-from sqlalchemy import ForeignKey, Integer, String
-# from _mysql_exceptions import OperationalError
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, func
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.orm.exc import NoResultFound  # , MultipleResultsFound
+from sqlalchemy.orm.exc import NoResultFound
 from sys import argv
 from time import sleep
 from wotconsole import player_data, WOTXResponseError
+
+from database import Player, setup_trigger
+from utils import generate_players
 
 try:
     range = xrange
 except NameError:
     pass
-
-Base = declarative_base()
-
-
-class Player(Base):
-    __tablename__ = 'players'
-
-    account_id = Column(Integer, primary_key=True)
-    # Biggest I've seen is 26 thanks to the "_old_######" accounts
-    nickname = Column(String(34), nullable=False)
-    console = Column(String(4), nullable=False)
-    created_at = Column(DateTime, nullable=False)
-    last_battle_time = Column(DateTime, nullable=False)
-    updated_at = Column(DateTime, nullable=False)
-    battles = Column(Integer, nullable=False)
-    _last_api_pull = Column(DateTime, nullable=False)
-
-    def __repr__(self):
-        return "<Player(account_id={}, nickname='{}', console='{}', battles={})>".format(
-            self.account_id,
-            self.nickname,
-            self.console,
-            self.battles
-        )
-
-
-class Diff_Battles(Base):
-    __tablename__ = datetime.utcnow().strftime('diff_battles_%Y_%m_%d')
-
-    account_id = Column(
-        Integer,
-        ForeignKey('players.account_id'),
-        primary_key=True)
-    battles = Column(Integer, nullable=False)
-
-    def __repr__(self):
-        return "<Diff Battles(account_id={}, battles={})".format(
-            self.account_id, self.battles)
-
-
-class Total_Battles(Base):
-    __tablename__ = datetime.utcnow().strftime('total_battles_%Y_%m_%d')
-
-    account_id = Column(
-        Integer,
-        ForeignKey('players.account_id'),
-        primary_key=True)
-    battles = Column(Integer, nullable=False)
-
-    def __repr__(self):
-        return "<Total Battles(account_id={}, battles={})".format(
-            self.account_id, self.battles)
 
 
 def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
@@ -83,6 +30,13 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
         )
         Session = sessionmaker(bind=engine)
         session = Session()
+        data_fields = (
+            'created_at',
+            'account_id',
+            'last_battle_time',
+            'nickname',
+            'updated_at',
+            'statistics.all.battles')
         while not work.empty():
             t_players, realm = work.get(False, 0.000001)
             retries = max_retries
@@ -91,14 +45,7 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
                     response = player_data(
                         t_players,
                         token,
-                        fields=(
-                            'created_at',
-                            'account_id',
-                            'last_battle_time',
-                            'nickname',
-                            'updated_at',
-                            'statistics.all.battles'
-                        ),
+                        fields=data_fields,
                         language=lang,
                         api_realm=realm,
                         timeout=timeout
@@ -236,58 +183,6 @@ def log_worker(queue, filename, conn):
         pass
 
 
-def setup_trigger(db):
-    engine = create_engine(
-        "{protocol}://{user}:{password}@{address}/{name}".format(**db),
-        echo=False)
-    Session = sessionmaker(bind=engine)
-    session = Session()
-    battle_ddl = DDL("""
-        CREATE TRIGGER update_battles BEFORE UPDATE ON players
-        FOR EACH ROW
-        BEGIN
-            IF (OLD.battles < NEW.battles) THEN
-                INSERT INTO {} VALUES (NEW.account_id, NEW.battles);
-                INSERT INTO {} VALUES (NEW.account_id, NEW.battles - OLD.battles);
-            END IF;
-        END
-    """.format(Total_Battles.__tablename__, Diff_Battles.__tablename__))
-    event.listen(
-        Player.__table__,
-        'after_create',
-        battle_ddl.execute_if(
-            dialect='mysql'))
-    newplayer_ddl = DDL("""
-        CREATE TRIGGER new_player AFTER INSERT ON players
-        FOR EACH ROW INSERT INTO {} VALUES (NEW.account_id, NEW.battles);
-    """.format(Total_Battles.__tablename__))
-    event.listen(
-        Player.__table__,
-        'after_create',
-        newplayer_ddl.execute_if(
-            dialect='mysql'))
-    Base.metadata.create_all(engine)
-    session.execute("""
-        DROP TRIGGER IF EXISTS new_player;
-        DROP TRIGGER IF EXISTS update_battles;
-    """)
-    session.execute(battle_ddl)
-    session.execute(newplayer_ddl)
-    session.commit()
-
-
-def generate_players(xbox_start, xbox_finish, ps4_start, ps4_finish):
-    '''
-    Create the list of players to query for
-
-    :param int xbox_start: Starting Xbox account ID number
-    :param int xbox_finish: Ending Xbox account ID number
-    :param int ps4_start: Starting PS4 account ID number
-    :param int ps4_finish: Ending PS4 account ID number
-    '''
-    return chain(range(xbox_start, xbox_finish + 1),
-                 range(ps4_start, ps4_finish + 1))
-
 if __name__ == '__main__':
 
     with open(argv[1]) as f:
@@ -314,17 +209,9 @@ if __name__ == '__main__':
     timeout = 15 if 'timeout' not in config else config['timeout']
     debug = False if 'debug' not in config else config['debug']
 
-    # user = 'root' if 'user' not in config[
-    #     'database'] else config['database']['user']
-    # password = config['database']['password']
-    # address = 'localhost' if 'address' not in config[
-    #     'database'] else config['database']['address']
-    # proto = 'mysql' if 'protocol' not in config[
-    #     'database'] else config['database']['protocol']
-    # databasename = config['database']['name']
+    timestamp = '%Y-%m-%d %H:%M:%S'
 
     manager = Manager()
-
     work_queue = manager.Queue()
     errors = manager.Queue()
     debug_messages = manager.Queue()
@@ -350,6 +237,7 @@ if __name__ == '__main__':
     plist = []
     realm = 'ps4'
     try:
+        # Replace with `while True`?
         while p <= ps4_max_account:
             if len(plist) == 100:
                 work_queue.put((tuple(plist), realm))
@@ -414,7 +302,7 @@ if __name__ == '__main__':
         )
 
     try:
-        print('Started at:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print('Started at:', datetime.now().strftime(timestamp))
         for logger in loggers:
             logger.start()
         for process in processes:
@@ -429,5 +317,5 @@ if __name__ == '__main__':
             conn.send(-1)
         for logger in loggers:
             logger.join()
-        print('Finished at:', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        print('Finished at:', datetime.now().strftime(timestamp))
         expand_max_players(config)
