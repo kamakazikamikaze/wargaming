@@ -1,0 +1,53 @@
+curl -XPUT "http://<server>:9200/_template/total_battles" -H 'Content-Type: application/json' -d'
+{
+  "index_patterns": ["total_battles-*"],
+  "settings": {
+    "number_of_shards": 1
+  },
+  "mappings": {
+    "total": {
+      "_source": {
+        "enabled": true
+      },
+      "properties": {
+        "account_id": {
+          "type": "integer"
+        },
+        "battles": {
+          "type": "integer"
+        },
+        "date": {
+          "type": "date",
+          "format": "yyyy-MM-dd"
+        }
+      }
+    }
+  }
+}'
+
+curl -XPUT "http://<server>:9200/_template/diff_battles" -H 'Content-Type: application/json' -d'
+{
+  "index_patterns": ["diff_battles-*"],
+  "settings": {
+    "number_of_shards": 1
+  },
+  "mappings": {
+    "diff": {
+      "_source": {
+        "enabled": true
+      },
+      "properties": {
+        "account_id": {
+          "type": "integer"
+        },
+        "battles": {
+          "type": "integer"
+        },
+        "date": {
+          "type": "date",
+          "format": "yyyy-MM-dd"
+        }
+      }
+    }
+  }
+}'

@@ -40,7 +40,7 @@ class Diff_Battles(Base):
     battles = Column(Integer, nullable=False)
 
     def __repr__(self):
-        return "<Diff Battles(account_id={}, battles={})".format(
+        return "<Diff Battles(account_id={}, battles={})>".format(
             self.account_id, self.battles)
 
 
@@ -54,7 +54,7 @@ class Total_Battles(Base):
     battles = Column(Integer, nullable=False)
 
     def __repr__(self):
-        return "<Total Battles(account_id={}, battles={})".format(
+        return "<Total Battles(account_id={}, battles={})>".format(
             self.account_id, self.battles)
 
 
