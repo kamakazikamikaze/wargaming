@@ -88,6 +88,9 @@ def load_local(conf):
         for dump in indexdata['dumps'][name]:
             data = pickle.load(path.join(conf['data folder'], dump))
             try:
+                if conf['delete old index on reload']:
+                    es = Elasticsearch(**cluster)
+                    es.delete(data[0]['_index'], ignore_unavailable=True)
                 _send_to_cluster(cluster, data)
                 success.add(dump)
                 remove(path.join(conf['data folder'], dump))
