@@ -5,7 +5,7 @@ from elasticsearch.helpers import BulkIndexError
 import cPickle as pickle
 import json
 from uuid import uuid4
-from os import makedirs, path, remove
+from os import makedirs, path, remove, pardir
 
 
 def check_index(conf):
@@ -29,8 +29,9 @@ def send_data(conf, data, action='create'):
                 _send_to_cluster(cluster, data)
             elif action == 'update':
                 _update_to_cluster(cluster, data)
-        except (BulkIndexError, TransportError):
+        except (BulkIndexError, TransportError) as err:
             print('ES: Error encountered. Offloading data.')
+            print('ES: Error:', err)
             offload_local(
                 name,
                 cluster,
@@ -89,6 +90,8 @@ def offload_local(name, clusterconf, dumpconf, data):
         with open(dumpconf['index']) as f:
             indexdata = json.load(f)
     else:
+        if not path.exists(path.abspath(path.join(dumpconf['index'], pardir))):
+            makedirs(path.abspath(path.join(dumpconf['index'], pardir)))
         indexdata = {'clusters': {}, 'dumps': {}}
     if name not in indexdata['clusters']:
         indexdata['clusters'][name] = clusterconf

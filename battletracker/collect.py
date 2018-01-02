@@ -225,6 +225,38 @@ def send_to_elasticsearch(conf):
     print('ES: Finished at', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
 
+def send_everything(conf):
+    from sqlalchemy.ext.declarative import declarative_base
+    Base = declarative_base()
+    dbconf = conf['database']
+    engine = create_engine(
+        "{protocol}://{user}:{password}@{address}/{name}".format(**dbconf),
+        echo=False)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    Base.metadata.reflect(engine)
+    for table in Base.metadata.tables.keys():
+        print('ES: Sending', table, 'at',
+              datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        if 'diff' in table:
+            diffs = list(
+                create_generator_diffs(
+                    datetime.strptime(table, 'diff_battles_%Y_%m_%d'),
+                    session.query(Base.metadata.tables[table]).all()))
+            send_data(conf, diffs)
+        elif 'total' in table:
+            totals = list(
+                create_generator_totals(
+                    datetime.strptime(table, 'total_battles_%Y_%m_%d'),
+                    session.query(Base.metadata.tables[table]).all()))
+            send_data(conf, totals)
+        elif 'player' in table:
+            players = list(
+                create_generator_players(
+                    session.query(Base.metadata.tables[table]).all()))
+            send_data(conf, players, 'update')
+
+
 def start(config):
     apikey = config['application_id']
     language = 'en' if 'language' not in config else config['language']
