@@ -5,7 +5,7 @@ from elasticsearch.helpers import BulkIndexError
 import cPickle as pickle
 import json
 from uuid import uuid4
-from os import path, remove
+from os import makedirs, path, remove
 
 
 def check_index(conf):
@@ -79,6 +79,8 @@ def offload_local(name, clusterconf, dumpconf, data):
     :param list(dict) data: All ES documents to be flushed to disk
     """
     dumpuuid = str(uuid4())
+    if not path.exists(dumpconf['data folder']):
+        makedirs(dumpconf['data folder'])
     with open(path.join(dumpconf['data folder'], dumpuuid), 'wb') as outfile:
         pickle.dump(data, outfile, pickle.HIGHEST_PROTOCOL)
     # with open(conf['index'], 'a') as indexfile:
