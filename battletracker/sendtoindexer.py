@@ -1,3 +1,4 @@
+from __future__ import print_function
 from elasticsearch import Elasticsearch, helpers
 from elasticsearch import TransportError
 from elasticsearch.helpers import BulkIndexError
@@ -15,11 +16,21 @@ def create_index(conf):
     pass
 
 
-def send_data(conf, data):
+def send_data(conf, data, action='create'):
+    r"""
+    Send data to Elasticsearch cluster(s)
+
+    :param dict conf: Full configuration
+    :param list(dict) data: All ES docs to send
+    """
     for name, cluster in conf['elasticsearch']['clusters'].items():
         try:
-            _send_to_cluster(cluster, data)
+            if action == 'create':
+                _send_to_cluster(cluster, data)
+            elif action == 'update':
+                _update_to_cluster(cluster, data)
         except (BulkIndexError, TransportError):
+            print('ES: Error encountered. Offloading data.')
             offload_local(
                 name,
                 cluster,
@@ -36,15 +47,25 @@ def _send_to_cluster(conf, data):
     :param dict conf: Connection parameters for `elasticsearch.Elasticsearch`
     :param list(dict) data: ES documents to send
     """
-    # chunk = None
     es = Elasticsearch(**conf)
-    # for chunk in chunker(data, conf['elasticsearch']['max bulk']):
-    #     # body = '\n'.join(map(lambda doc: jdumps(doc), chunk))
-    #     es.bulk(body='\n'.join(map(jdumps, chunk)),
-    #             index=conf['elasticsearch']['index'],
-    #             doc_type=conf['elasticsearch']['type'],
-    #             timeout=conf['elasticsearch']['timeout'])
     helpers.bulk(es, data)
+
+
+def _update_to_cluster(conf, data):
+    es = Elasticsearch(**conf)
+    for doc in data:
+        try:
+            es.update(
+                index=doc['_index'],
+                doc_type=doc['_type'],
+                id=doc['_id'],
+                body={
+                    'doc': doc['_source']})
+        except TransportError as te:
+            if te.args[1] == 'document_missing_exception':
+                helpers.bulk(es, [doc])
+            else:
+                raise te
 
 
 def offload_local(name, clusterconf, dumpconf, data):
@@ -83,14 +104,16 @@ def load_local(conf):
     """
     with open(conf['index']) as f:
         indexdata = json.load(f)
-    for name, cluster in indexdata['clusters']:
+    for name, cluster in indexdata['clusters'].items():
         success = set()
         for dump in indexdata['dumps'][name]:
-            data = pickle.load(path.join(conf['data folder'], dump))
+            with open(path.join(conf['data folder'], dump), 'rb') as f:
+                data = pickle.load(f)
             try:
                 if conf['delete old index on reload']:
                     es = Elasticsearch(**cluster)
-                    es.delete(data[0]['_index'], ignore_unavailable=True)
+                    es.indices.delete(
+                        data[0]['_index'], ignore_unavailable=True)
                 _send_to_cluster(cluster, data)
                 success.add(dump)
                 remove(path.join(conf['data folder'], dump))
@@ -146,6 +169,6 @@ def create_generator_players(query_results):
             "last_battle_time": player.last_battle_time,
             "updated_at": player.updated_at,
             "battles": player.battles,
-            "last_api_pull": player.last_api_pull
+            "last_api_pull": player._last_api_pull
         }
     } for player in query_results)

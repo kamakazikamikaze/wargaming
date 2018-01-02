@@ -12,7 +12,9 @@ from sys import argv
 from time import sleep
 from wotconsole import player_data, WOTXResponseError
 
-from database import Player, setup_trigger
+from database import Diff_Battles, Player, setup_trigger, Total_Battles
+from sendtoindexer import create_generator_diffs, create_generator_players
+from sendtoindexer import create_generator_totals, send_data
 from utils import generate_players
 
 try:
@@ -56,7 +58,8 @@ def query(worker_number, work, dbconf, token='demo', lang='en', timeout=15,
                             continue
                         try:
                             p = session.query(Player).filter(
-                                Player.account_id == player['account_id']).one()
+                                Player.account_id == player['account_id']
+                            ).one()
                             p.battles = player['statistics']['all']['battles']
                             p.last_battle_time = datetime.utcfromtimestamp(
                                 player['last_battle_time'])
@@ -183,11 +186,46 @@ def log_worker(queue, filename, conn):
         pass
 
 
-if __name__ == '__main__':
+def send_to_elasticsearch(conf):
+    dbconf = conf['database']
+    engine = create_engine(
+        "{protocol}://{user}:{password}@{address}/{name}".format(**dbconf),
+        echo=False)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+    totals = list(
+        create_generator_totals(
+            datetime.utcnow(),
+            session.query(Total_Battles).all()))
+    print(
+        'ES: Sending totals at',
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    send_data(conf, totals)
+    diffs = list(
+        create_generator_diffs(
+            datetime.utcnow(),
+            session.query(Diff_Battles).all()))
+    print(
+        'ES: Sending diffs at',
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    send_data(conf, diffs)
+    # player_ids = set.union(
+    #     set(map(lambda p: int(p.account_id), totals)),
+    #     set(map(lambda p: int(p.account_id), diffs)))
+    player_ids = set.union(
+        set(map(lambda p: int(p['_source']['account_id']), totals)),
+        set(map(lambda p: int(p['_source']['account_id']), diffs)))
+    players = list(
+        create_generator_players(session.query(Player).filter(
+            Player.account_id.in_(player_ids)).all()))
+    print(
+        'ES: Sending players at',
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    send_data(conf, players, 'update')
+    print('ES: Finished at', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
-    with open(argv[1]) as f:
-        config = json.load(f)
 
+def start(config):
     apikey = config['application_id']
     language = 'en' if 'language' not in config else config['language']
     process_count = 12 if 'processes' not in config else config[
@@ -302,7 +340,7 @@ if __name__ == '__main__':
         )
 
     try:
-        print('Started at:', datetime.now().strftime(timestamp))
+        print('Started pulling at:', datetime.now().strftime(timestamp))
         for logger in loggers:
             logger.start()
         for process in processes:
@@ -317,5 +355,15 @@ if __name__ == '__main__':
             conn.send(-1)
         for logger in loggers:
             logger.join()
-        print('Finished at:', datetime.now().strftime(timestamp))
+        print('Finished pulling at:', datetime.now().strftime(timestamp))
         expand_max_players(config)
+
+    if 'elasticsearch' in config:
+        print('Preparing process to send data to Elasticsearch')
+        send_to_elasticsearch(config)
+
+if __name__ == '__main__':
+
+    with open(argv[1]) as f:
+        config = json.load(f)
+    start(config)

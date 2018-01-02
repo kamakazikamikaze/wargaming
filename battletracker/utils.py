@@ -31,6 +31,7 @@ def create_config(filename):
         'max retries': 5,
         'timeout': 15,
         'debug': False,
+        'processes': 12,
         'logging': {
             'errors': 'logs/error-%Y_%m_%d'
         },
